@@ -120,7 +120,7 @@
     (duration-blocks uint))
   (let 
     ((snapshot-id (+ (var-get current-snapshot-id) u1))
-     (end-block (+ block-height duration-blocks)))
+     (end-block (+ stacks-block-height duration-blocks)))
     (asserts! 
       (is-some (map-get? registered-projects tx-sender)) 
       ERR-UNAUTHORIZED)
@@ -150,7 +150,7 @@
       (is-some (map-get? registered-projects tx-sender)) 
       ERR-UNAUTHORIZED)
     (ok (map-set user-activity {user: user, criteria-type: criteria-type}
-      {score: (+ (get score current-data) score), last-updated: block-height}))
+      {score: (+ (get score current-data) score), last-updated: stacks-block-height}))
   )
 )
 
@@ -160,19 +160,18 @@
     ((snapshot-data (unwrap! (map-get? snapshots snapshot-id) ERR-INVALID-SNAPSHOT))
      (user-score-data (map-get? user-activity 
         {user: tx-sender, criteria-type: (get criteria-type snapshot-data)}))
-     (user-score (default-to u0 (get score (default-to {score: u0, last-updated: u0} user-score-data))))
+     (user-score (match user-score-data data (get score data) u0))
      (tier (calculate-tier user-score))
      (token-id (+ (var-get last-token-id) u1)))
     
     ;; Check if snapshot is still active
     (asserts! (get active snapshot-data) ERR-INVALID-SNAPSHOT)
-    (asserts! (<= block-height (get end-block snapshot-data)) ERR-INVALID-SNAPSHOT)
+    (asserts! (<= stacks-block-height (get end-block snapshot-data)) ERR-INVALID-SNAPSHOT)
     
     ;; Check if user hasn't already claimed
-    (asserts! 
-      (not (default-to false 
-        (get claimed (default-to {claimed: false, tier: u0, token-id: u0} 
-          (map-get? claimed-rewards {user: tx-sender, snapshot-id: snapshot-id})))))
+    (asserts!
+      (not (get claimed (default-to {claimed: false, tier: u0, token-id: u0}
+        (map-get? claimed-rewards {user: tx-sender, snapshot-id: snapshot-id}))))
       ERR-ALREADY-CLAIMED)
     
     ;; Check if user meets minimum threshold
@@ -242,5 +241,130 @@
     (ok (map-set cross-protocol-scores tx-sender
       {protocols: (unwrap! (as-max-len? (append (get protocols current-data) protocol) u20) ERR-INVALID-SNAPSHOT),
        total-score: (+ (get total-score current-data) score)}))
+  )
+)
+
+
+;; read only functions
+
+;; Get user activity score for specific criteria
+(define-read-only (get-user-activity (user principal) (criteria-type (string-ascii 50)))
+  (map-get? user-activity {user: user, criteria-type: criteria-type})
+)
+
+;; Get snapshot information
+(define-read-only (get-snapshot (snapshot-id uint))
+  (map-get? snapshots snapshot-id)
+)
+
+;; Check if user has claimed rewards for a snapshot
+(define-read-only (has-claimed-rewards (user principal) (snapshot-id uint))
+  (match (map-get? claimed-rewards {user: user, snapshot-id: snapshot-id})
+    data (get claimed data)
+    false)
+)
+
+;; Get token metadata
+(define-read-only (get-token-metadata (token-id uint))
+  (map-get? token-metadata token-id)
+)
+
+;; Get token URI
+(define-read-only (get-token-uri (token-id uint))
+  (ok (get uri (default-to 
+    {tier: u0, snapshot-id: u0, score: u0, uri: ""} 
+    (map-get? token-metadata token-id))))
+)
+
+;; Get token owner
+(define-read-only (get-owner (token-id uint))
+  (ok (nft-get-owner? loyalty-nft token-id))
+)
+
+;; Get last token ID
+(define-read-only (get-last-token-id)
+  (ok (var-get last-token-id))
+)
+
+;; Get governance weight for a user
+(define-read-only (get-governance-weight (user principal))
+  (map-get? governance-weights user)
+)
+
+;; Get cross-protocol loyalty score
+(define-read-only (get-cross-protocol-score (user principal))
+  (map-get? cross-protocol-scores user)
+)
+
+;; Check if project is registered
+(define-read-only (is-registered-project (project principal))
+  (is-some (map-get? registered-projects project))
+)
+
+;; Calculate tier based on score
+(define-read-only (calculate-tier-view (score uint))
+  (calculate-tier score)
+)
+
+;; private functions
+
+;; Calculate tier based on user score
+(define-private (calculate-tier (score uint))
+  (if (>= score PLATINUM-THRESHOLD)
+    TIER-PLATINUM
+    (if (>= score GOLD-THRESHOLD)
+      TIER-GOLD
+      (if (>= score SILVER-THRESHOLD)
+        TIER-SILVER
+        TIER-BRONZE
+      )
+    )
+  )
+)
+
+;; Generate token URI based on tier
+(define-private (generate-token-uri (tier uint))
+  (if (is-eq tier TIER-PLATINUM)
+    "ipfs://QmPlatinum/metadata.json"
+    (if (is-eq tier TIER-GOLD)
+      "ipfs://QmGold/metadata.json"
+      (if (is-eq tier TIER-SILVER)
+        "ipfs://QmSilver/metadata.json"
+        "ipfs://QmBronze/metadata.json"
+      )
+    )
+  )
+)
+
+;; Update governance weight when NFT is minted or transferred
+(define-private (update-governance-weight (user principal) (token-id uint) (tier uint))
+  (let 
+    ((current-weight (default-to {total-weight: u0, tokens: (list)} 
+        (map-get? governance-weights user)))
+     (new-tokens (unwrap-panic (as-max-len? (append (get tokens current-weight) token-id) u50))))
+    (begin
+      (map-set governance-weights user {
+        total-weight: (+ (get total-weight current-weight) (* tier u10)),
+        tokens: new-tokens
+      })
+      true
+    )
+  )
+)
+
+;; Remove governance weight when NFT is transferred
+(define-private (remove-governance-weight (user principal) (token-id uint) (tier uint))
+  (let 
+    (
+      (current-weight (default-to {total-weight: u0, tokens: (list)} 
+        (map-get? governance-weights user)))
+    )
+    (begin
+      (map-set governance-weights user {
+        total-weight: (- (get total-weight current-weight) (* tier u10)),
+        tokens: (get tokens current-weight)
+      })
+      true
+    )
   )
 )
