@@ -28,6 +28,11 @@
 (define-constant ERR-INVALID-SNAPSHOT (err u105))
 (define-constant ERR-TOKEN-NOT-FOUND (err u106))
 (define-constant ERR-UNAUTHORIZED (err u107))
+(define-constant ERR-CONTRACT-PAUSED (err u108))
+(define-constant ERR-RATE-LIMIT-EXCEEDED (err u109))
+(define-constant ERR-OVERFLOW (err u110))
+(define-constant ERR-INVALID-INPUT (err u111))
+(define-constant ERR-UNDERFLOW (err u112))
 
 (define-constant TIER-BRONZE u1)
 (define-constant TIER-SILVER u2)
@@ -39,11 +44,15 @@
 (define-constant GOLD-THRESHOLD u25000)
 (define-constant PLATINUM-THRESHOLD u100000)
 
+(define-constant RATE-LIMIT-BLOCKS u10)
+(define-constant MAX-OPERATIONS-PER-BLOCK u5)
+
 ;; data vars
 (define-data-var last-token-id uint u0)
 (define-data-var contract-uri (string-ascii 256) "")
 (define-data-var snapshot-active bool false)
 (define-data-var current-snapshot-id uint u0)
+(define-data-var contract-paused bool false)
 
 ;; data maps
 ;; Store user activity scores for different criteria types
@@ -101,12 +110,89 @@
   {protocols: (list 20 (string-ascii 50)), total-score: uint}
 )
 
+(define-map last-operation-block principal uint)
+(define-map operations-per-block {user: principal, block: uint} uint)
+
+;; Security helper functions
+(define-private (check-not-paused)
+  (if (var-get contract-paused)
+    ERR-CONTRACT-PAUSED
+    (ok true)
+  )
+)
+
+(define-private (safe-add (a uint) (b uint))
+  (let ((result (+ a b)))
+    (asserts! (>= result a) ERR-OVERFLOW)
+    (ok result)
+  )
+)
+
+(define-private (safe-mul (a uint) (b uint))
+  (let ((result (* a b)))
+    (asserts! (or (is-eq b u0) (is-eq (/ result b) a)) ERR-OVERFLOW)
+    (ok result)
+  )
+)
+
+(define-private (safe-sub (a uint) (b uint))
+  (if (>= a b)
+    (ok (- a b))
+    ERR-UNDERFLOW
+  )
+)
+
+(define-private (check-rate-limit (user principal))
+  (let (
+    (current-block burn-block-height)
+    (last-block (default-to u0 (map-get? last-operation-block user)))
+    (ops-count (default-to u0 (map-get? operations-per-block {user: user, block: current-block})))
+  )
+    (asserts! 
+      (or 
+        (>= (- current-block last-block) RATE-LIMIT-BLOCKS)
+        (< ops-count MAX-OPERATIONS-PER-BLOCK)
+      )
+      ERR-RATE-LIMIT-EXCEEDED
+    )
+    (map-set last-operation-block user current-block)
+    (map-set operations-per-block {user: user, block: current-block} (+ ops-count u1))
+    (ok true)
+  )
+)
+
+(define-private (validate-string-not-empty (str (string-ascii 50)))
+  (if (> (len str) u0)
+    (ok true)
+    ERR-INVALID-INPUT
+  )
+)
+
 ;; public functions
+
+;; Pause/unpause contract (owner only)
+(define-public (pause-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (var-set contract-paused true)
+    (ok true)
+  )
+)
+
+(define-public (unpause-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (var-set contract-paused false)
+    (ok true)
+  )
+)
 
 ;; Register a new project that can create snapshots
 (define-public (register-project (name (string-ascii 100)))
   (begin
+    (try! (check-not-paused))
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (asserts! (> (len name) u0) ERR-INVALID-INPUT)
     (ok (map-set registered-projects tx-sender 
       {name: name, active: true, snapshots-created: u0}))
   )
@@ -119,8 +205,14 @@
     (max-rewards uint)
     (duration-blocks uint))
   (let 
-    ((snapshot-id (+ (var-get current-snapshot-id) u1))
-     (end-block (+ stacks-block-height duration-blocks)))
+    ((snapshot-id (unwrap! (safe-add (var-get current-snapshot-id) u1) ERR-OVERFLOW))
+     (end-block (unwrap! (safe-add burn-block-height duration-blocks) ERR-OVERFLOW)))
+    (try! (check-not-paused))
+    (try! (check-rate-limit tx-sender))
+    (try! (validate-string-not-empty criteria-type))
+    (asserts! (> min-threshold u0) ERR-INVALID-INPUT)
+    (asserts! (> max-rewards u0) ERR-INVALID-INPUT)
+    (asserts! (> duration-blocks u0) ERR-INVALID-INPUT)
     (asserts! 
       (is-some (map-get? registered-projects tx-sender)) 
       ERR-UNAUTHORIZED)
@@ -146,11 +238,15 @@
   (let 
     ((current-data (default-to {score: u0, last-updated: u0} 
         (map-get? user-activity {user: user, criteria-type: criteria-type}))))
+    (try! (check-not-paused))
+    (try! (check-rate-limit tx-sender))
+    (try! (validate-string-not-empty criteria-type))
+    (asserts! (> score u0) ERR-INVALID-INPUT)
     (asserts! 
       (is-some (map-get? registered-projects tx-sender)) 
       ERR-UNAUTHORIZED)
     (ok (map-set user-activity {user: user, criteria-type: criteria-type}
-      {score: (+ (get score current-data) score), last-updated: stacks-block-height}))
+      {score: (unwrap! (safe-add (get score current-data) score) ERR-OVERFLOW), last-updated: burn-block-height}))
   )
 )
 
@@ -162,11 +258,14 @@
         {user: tx-sender, criteria-type: (get criteria-type snapshot-data)}))
      (user-score (match user-score-data data (get score data) u0))
      (tier (calculate-tier user-score))
-     (token-id (+ (var-get last-token-id) u1)))
+     (token-id (unwrap! (safe-add (var-get last-token-id) u1) ERR-OVERFLOW)))
+    
+    (try! (check-not-paused))
+    (try! (check-rate-limit tx-sender))
     
     ;; Check if snapshot is still active
     (asserts! (get active snapshot-data) ERR-INVALID-SNAPSHOT)
-    (asserts! (<= stacks-block-height (get end-block snapshot-data)) ERR-INVALID-SNAPSHOT)
+    (asserts! (<= burn-block-height (get end-block snapshot-data)) ERR-INVALID-SNAPSHOT)
     
     ;; Check if user hasn't already claimed
     (asserts!
@@ -197,7 +296,7 @@
     
     ;; Update snapshot rewards count
     (map-set snapshots snapshot-id 
-      (merge snapshot-data {rewards-minted: (+ (get rewards-minted snapshot-data) u1)}))
+      (merge snapshot-data {rewards-minted: (unwrap! (safe-add (get rewards-minted snapshot-data) u1) ERR-OVERFLOW)}))
     
     ;; Update governance weights
     (update-governance-weight tx-sender token-id tier)
@@ -206,7 +305,7 @@
     (var-set last-token-id token-id)
     
     ;; Mint loyalty tokens based on tier
-    (try! (ft-mint? loyalty-token (* tier u100) tx-sender))
+    (try! (ft-mint? loyalty-token (unwrap! (safe-mul tier u100) ERR-OVERFLOW) tx-sender))
     
     (ok token-id)
   )
@@ -217,6 +316,7 @@
   (let 
     ((token-owner (unwrap! (nft-get-owner? loyalty-nft token-id) ERR-TOKEN-NOT-FOUND))
      (token-data (unwrap! (map-get? token-metadata token-id) ERR-TOKEN-NOT-FOUND)))
+    (try! (check-not-paused))
     (asserts! (is-eq tx-sender sender) ERR-NOT-TOKEN-OWNER)
     (asserts! (is-eq sender token-owner) ERR-NOT-TOKEN-OWNER)
     
@@ -238,9 +338,12 @@
   (let 
     ((current-data (default-to {protocols: (list), total-score: u0} 
         (map-get? cross-protocol-scores tx-sender))))
+    (try! (check-not-paused))
+    (try! (validate-string-not-empty protocol))
+    (asserts! (> score u0) ERR-INVALID-INPUT)
     (ok (map-set cross-protocol-scores tx-sender
       {protocols: (unwrap! (as-max-len? (append (get protocols current-data) protocol) u20) ERR-INVALID-SNAPSHOT),
-       total-score: (+ (get total-score current-data) score)}))
+       total-score: (unwrap! (safe-add (get total-score current-data) score) ERR-OVERFLOW)}))
   )
 )
 
@@ -306,6 +409,22 @@
   (calculate-tier score)
 )
 
+;; Security read-only functions
+(define-read-only (is-contract-paused)
+  (var-get contract-paused)
+)
+
+(define-read-only (get-last-operation-block (user principal))
+  (default-to u0 (map-get? last-operation-block user))
+)
+
+(define-read-only (get-snapshot-creator (snapshot-id uint))
+  (match (map-get? snapshots snapshot-id)
+    snapshot (some (get creator snapshot))
+    none
+  )
+)
+
 ;; private functions
 
 ;; Calculate tier based on user score
@@ -341,10 +460,12 @@
   (let 
     ((current-weight (default-to {total-weight: u0, tokens: (list)} 
         (map-get? governance-weights user)))
-     (new-tokens (unwrap-panic (as-max-len? (append (get tokens current-weight) token-id) u50))))
+     (new-tokens (unwrap-panic (as-max-len? (append (get tokens current-weight) token-id) u50)))
+     (tier-weight (unwrap-panic (safe-mul tier u10)))
+     (new-total-weight (unwrap-panic (safe-add (get total-weight current-weight) tier-weight))))
     (begin
       (map-set governance-weights user {
-        total-weight: (+ (get total-weight current-weight) (* tier u10)),
+        total-weight: new-total-weight,
         tokens: new-tokens
       })
       true
@@ -358,10 +479,12 @@
     (
       (current-weight (default-to {total-weight: u0, tokens: (list)} 
         (map-get? governance-weights user)))
+      (tier-weight (unwrap-panic (safe-mul tier u10)))
+      (new-total-weight (unwrap-panic (safe-sub (get total-weight current-weight) tier-weight)))
     )
     (begin
       (map-set governance-weights user {
-        total-weight: (- (get total-weight current-weight) (* tier u10)),
+        total-weight: new-total-weight,
         tokens: (get tokens current-weight)
       })
       true
