@@ -217,4 +217,211 @@ describe("RetroRewards Security Tests", () => {
       expect(result).toBeUint(0);
     });
   });
+
+  describe("Emergency Mode", () => {
+    it("should allow owner to activate emergency mode", () => {
+      const { result } = simnet.callPublicFn("RetroRewards", "activate-emergency-mode", [], deployer);
+      expect(result).toBeOk(Cl.bool(true));
+    });
+
+    it("should prevent non-owner from activating emergency mode", () => {
+      const { result } = simnet.callPublicFn("RetroRewards", "activate-emergency-mode", [], address1);
+      expect(result).toBeErr(Cl.uint(100)); // ERR-OWNER-ONLY
+    });
+
+    it("should allow owner to deactivate emergency mode", () => {
+      simnet.callPublicFn("RetroRewards", "activate-emergency-mode", [], deployer);
+      simnet.mineEmptyBlocks(145); // Wait for cooldown
+      const { result } = simnet.callPublicFn("RetroRewards", "deactivate-emergency-mode", [], deployer);
+      expect(result).toBeOk(Cl.bool(true));
+    });
+
+    it("should enforce emergency cooldown", () => {
+      simnet.callPublicFn("RetroRewards", "activate-emergency-mode", [], deployer);
+      const { result } = simnet.callPublicFn("RetroRewards", "deactivate-emergency-mode", [], deployer);
+      expect(result).toBeErr(Cl.uint(114)); // ERR-COOLDOWN-ACTIVE
+    });
+
+    it("should block snapshot creation during emergency", () => {
+      simnet.callPublicFn("RetroRewards", "register-project", [Cl.stringAscii("Test Project")], deployer);
+      simnet.callPublicFn("RetroRewards", "activate-emergency-mode", [], deployer);
+      
+      const { result } = simnet.callPublicFn("RetroRewards", "create-snapshot", [
+        Cl.stringAscii("trading"),
+        Cl.uint(1000),
+        Cl.uint(100),
+        Cl.uint(1000)
+      ], deployer);
+      expect(result).toBeErr(Cl.uint(113)); // ERR-EMERGENCY-ONLY
+    });
+  });
+
+  describe("Snapshot Management", () => {
+    it("should allow owner to deactivate snapshot", () => {
+      simnet.callPublicFn("RetroRewards", "register-project", [Cl.stringAscii("Test Project")], deployer);
+      simnet.callPublicFn("RetroRewards", "create-snapshot", [
+        Cl.stringAscii("trading"),
+        Cl.uint(1000),
+        Cl.uint(100),
+        Cl.uint(1000)
+      ], deployer);
+
+      const { result } = simnet.callPublicFn("RetroRewards", "deactivate-snapshot", [Cl.uint(1)], deployer);
+      expect(result).toBeOk(Cl.bool(true));
+    });
+
+    it("should allow owner to reactivate snapshot", () => {
+      simnet.callPublicFn("RetroRewards", "register-project", [Cl.stringAscii("Test Project")], deployer);
+      simnet.callPublicFn("RetroRewards", "create-snapshot", [
+        Cl.stringAscii("trading"),
+        Cl.uint(1000),
+        Cl.uint(100),
+        Cl.uint(1000)
+      ], deployer);
+      simnet.callPublicFn("RetroRewards", "deactivate-snapshot", [Cl.uint(1)], deployer);
+
+      const { result } = simnet.callPublicFn("RetroRewards", "reactivate-snapshot", [Cl.uint(1)], deployer);
+      expect(result).toBeOk(Cl.bool(true));
+    });
+
+    it("should prevent non-owner from deactivating snapshot", () => {
+      simnet.callPublicFn("RetroRewards", "register-project", [Cl.stringAscii("Test Project")], deployer);
+      simnet.callPublicFn("RetroRewards", "create-snapshot", [
+        Cl.stringAscii("trading"),
+        Cl.uint(1000),
+        Cl.uint(100),
+        Cl.uint(1000)
+      ], deployer);
+
+      const { result } = simnet.callPublicFn("RetroRewards", "deactivate-snapshot", [Cl.uint(1)], address1);
+      expect(result).toBeErr(Cl.uint(100)); // ERR-OWNER-ONLY
+    });
+
+    it("should enforce minimum snapshot duration", () => {
+      simnet.callPublicFn("RetroRewards", "register-project", [Cl.stringAscii("Test Project")], deployer);
+      
+      const { result } = simnet.callPublicFn("RetroRewards", "create-snapshot", [
+        Cl.stringAscii("trading"),
+        Cl.uint(1000),
+        Cl.uint(100),
+        Cl.uint(50) // Less than MIN_SNAPSHOT_DURATION (100)
+      ], deployer);
+      expect(result).toBeErr(Cl.uint(111)); // ERR-INVALID-INPUT
+    });
+  });
+
+  describe("Batch Operations", () => {
+    it("should reject empty batch", () => {
+      const { result } = simnet.callPublicFn("RetroRewards", "batch-claim-rewards", [
+        Cl.list([])
+      ], address1);
+      expect(result).toBeErr(Cl.uint(115)); // ERR-BATCH-TOO-LARGE
+    });
+
+    it("should validate batch size at type level", () => {
+      // Note: Clarity's type system prevents lists > 10 at compile time
+      // This test verifies the batch accepts exactly max size (10)
+      const snapshots = Array(10).fill(Cl.uint(1));
+      const { result } = simnet.callPublicFn("RetroRewards", "batch-claim-rewards", [
+        Cl.list(snapshots)
+      ], address1);
+      // Should not fail with batch size error (will fail for other reasons)
+      expect(result).not.toBeErr(Cl.uint(115));
+    });
+
+    it("should accept batch up to max size", () => {
+      const snapshots = Array(10).fill(Cl.uint(1));
+      const { result } = simnet.callPublicFn("RetroRewards", "batch-claim-rewards", [
+        Cl.list(snapshots)
+      ], address1);
+      // Will fail for other reasons but not batch size
+      expect(result).not.toBeErr(Cl.uint(115));
+    });
+  });
+
+  describe("SIP-009 NFT Compliance", () => {
+    it("should return last token ID", () => {
+      const { result } = simnet.callReadOnlyFn("RetroRewards", "get-last-token-id", [], deployer);
+      expect(result).toBeOk(Cl.uint(0));
+    });
+
+    it("should return token URI", () => {
+      const { result } = simnet.callReadOnlyFn("RetroRewards", "get-token-uri", [Cl.uint(1)], deployer);
+      expect(result).toBeOk(Cl.stringAscii(""));
+    });
+
+    it("should return token owner", () => {
+      const { result } = simnet.callReadOnlyFn("RetroRewards", "get-owner", [Cl.uint(1)], deployer);
+      expect(result).toBeOk(Cl.none());
+    });
+  });
+
+  describe("Statistics Tracking", () => {
+    it("should track total rewards claimed", () => {
+      const { result } = simnet.callReadOnlyFn("RetroRewards", "get-total-rewards-claimed", [], deployer);
+      expect(result).toBeUint(0);
+    });
+
+    it("should track total snapshots created", () => {
+      const { result } = simnet.callReadOnlyFn("RetroRewards", "get-total-snapshots-created", [], deployer);
+      expect(result).toBeUint(0);
+    });
+
+    it("should increment snapshot counter on creation", () => {
+      simnet.callPublicFn("RetroRewards", "register-project", [Cl.stringAscii("Test Project")], deployer);
+      simnet.callPublicFn("RetroRewards", "create-snapshot", [
+        Cl.stringAscii("trading"),
+        Cl.uint(1000),
+        Cl.uint(100),
+        Cl.uint(1000)
+      ], deployer);
+
+      const { result } = simnet.callReadOnlyFn("RetroRewards", "get-total-snapshots-created", [], deployer);
+      expect(result).toBeUint(1);
+    });
+
+    it("should return tier statistics", () => {
+      const { result } = simnet.callReadOnlyFn("RetroRewards", "get-tier-statistics", [Cl.uint(1)], deployer);
+      expect(result).toBeDefined();
+    });
+
+    it("should return snapshot status", () => {
+      const { result } = simnet.callReadOnlyFn("RetroRewards", "get-snapshot-status", [Cl.uint(1)], deployer);
+      expect(result).toBeBool(false);
+    });
+  });
+
+  describe("Emergency Mode Read-Only", () => {
+    it("should check emergency mode status", () => {
+      const { result } = simnet.callReadOnlyFn("RetroRewards", "is-emergency-mode", [], deployer);
+      expect(result).toBeBool(false);
+    });
+
+    it("should get last emergency action", () => {
+      const { result } = simnet.callReadOnlyFn("RetroRewards", "get-last-emergency-action", [], deployer);
+      expect(result).toBeUint(0);
+    });
+  });
+
+  describe("Tier Calculation", () => {
+    it("should calculate bronze tier", () => {
+      const { result } = simnet.callReadOnlyFn("RetroRewards", "calculate-tier-view", [Cl.uint(1000)], deployer);
+      expect(result).toBeUint(1); // TIER-BRONZE
+    });
+
+    it("should calculate silver tier", () => {
+      const { result } = simnet.callReadOnlyFn("RetroRewards", "calculate-tier-view", [Cl.uint(5000)], deployer);
+      expect(result).toBeUint(2); // TIER-SILVER
+    });
+
+    it("should calculate gold tier", () => {
+      const { result } = simnet.callReadOnlyFn("RetroRewards", "calculate-tier-view", [Cl.uint(25000)], deployer);
+      expect(result).toBeUint(3); // TIER-GOLD
+    });
+
+    it("should calculate platinum tier", () => {
+      const { result } = simnet.callReadOnlyFn("RetroRewards", "calculate-tier-view", [Cl.uint(100000)], deployer);
+      expect(result).toBeUint(4); // TIER-PLATINUM
+    });
+  });
 });
