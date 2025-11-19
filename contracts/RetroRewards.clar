@@ -33,6 +33,10 @@
 (define-constant ERR-OVERFLOW (err u110))
 (define-constant ERR-INVALID-INPUT (err u111))
 (define-constant ERR-UNDERFLOW (err u112))
+(define-constant ERR-EMERGENCY-ONLY (err u113))
+(define-constant ERR-COOLDOWN-ACTIVE (err u114))
+(define-constant ERR-BATCH-TOO-LARGE (err u115))
+(define-constant ERR-SNAPSHOT-INACTIVE (err u116))
 
 (define-constant TIER-BRONZE u1)
 (define-constant TIER-SILVER u2)
@@ -46,6 +50,9 @@
 
 (define-constant RATE-LIMIT-BLOCKS u10)
 (define-constant MAX-OPERATIONS-PER-BLOCK u5)
+(define-constant MAX-BATCH-SIZE u10)
+(define-constant EMERGENCY-COOLDOWN-BLOCKS u144)
+(define-constant MIN-SNAPSHOT-DURATION u100)
 
 ;; data vars
 (define-data-var last-token-id uint u0)
@@ -53,6 +60,10 @@
 (define-data-var snapshot-active bool false)
 (define-data-var current-snapshot-id uint u0)
 (define-data-var contract-paused bool false)
+(define-data-var emergency-mode bool false)
+(define-data-var last-emergency-action uint u0)
+(define-data-var total-rewards-claimed uint u0)
+(define-data-var total-snapshots-created uint u0)
 
 ;; data maps
 ;; Store user activity scores for different criteria types
@@ -113,6 +124,12 @@
 (define-map last-operation-block principal uint)
 (define-map operations-per-block {user: principal, block: uint} uint)
 
+;; Tier statistics tracking
+(define-map tier-statistics uint {bronze: uint, silver: uint, gold: uint, platinum: uint})
+
+;; Snapshot status tracking
+(define-map snapshot-status uint bool)
+
 ;; Security helper functions
 (define-private (check-not-paused)
   (if (var-get contract-paused)
@@ -168,6 +185,41 @@
   )
 )
 
+(define-private (check-emergency-cooldown)
+  (let ((last-action (var-get last-emergency-action)))
+    (asserts! 
+      (or 
+        (is-eq last-action u0)
+        (>= (- burn-block-height last-action) EMERGENCY-COOLDOWN-BLOCKS)
+      )
+      ERR-COOLDOWN-ACTIVE
+    )
+    (ok true)
+  )
+)
+
+(define-private (check-not-emergency)
+  (if (var-get emergency-mode)
+    ERR-EMERGENCY-ONLY
+    (ok true)
+  )
+)
+
+(define-private (validate-batch-size (size uint))
+  (if (and (> size u0) (<= size MAX-BATCH-SIZE))
+    (ok true)
+    ERR-BATCH-TOO-LARGE
+  )
+)
+
+(define-private (check-snapshot-active (snapshot-id uint))
+  (let ((snapshot-data (unwrap! (map-get? snapshots snapshot-id) ERR-INVALID-SNAPSHOT)))
+    (asserts! (get active snapshot-data) ERR-SNAPSHOT-INACTIVE)
+    (asserts! (<= burn-block-height (get end-block snapshot-data)) ERR-SNAPSHOT-INACTIVE)
+    (ok true)
+  )
+)
+
 ;; public functions
 
 ;; Pause/unpause contract (owner only)
@@ -183,6 +235,47 @@
   (begin
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
     (var-set contract-paused false)
+    (ok true)
+  )
+)
+
+;; Emergency mode controls
+(define-public (activate-emergency-mode)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (try! (check-emergency-cooldown))
+    (var-set emergency-mode true)
+    (var-set last-emergency-action burn-block-height)
+    (ok true)
+  )
+)
+
+(define-public (deactivate-emergency-mode)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (try! (check-emergency-cooldown))
+    (var-set emergency-mode false)
+    (var-set last-emergency-action burn-block-height)
+    (ok true)
+  )
+)
+
+;; Deactivate/reactivate snapshots
+(define-public (deactivate-snapshot (snapshot-id uint))
+  (let ((snapshot-data (unwrap! (map-get? snapshots snapshot-id) ERR-INVALID-SNAPSHOT)))
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (map-set snapshots snapshot-id (merge snapshot-data {active: false}))
+    (map-set snapshot-status snapshot-id false)
+    (ok true)
+  )
+)
+
+(define-public (reactivate-snapshot (snapshot-id uint))
+  (let ((snapshot-data (unwrap! (map-get? snapshots snapshot-id) ERR-INVALID-SNAPSHOT)))
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (asserts! (<= burn-block-height (get end-block snapshot-data)) ERR-SNAPSHOT-INACTIVE)
+    (map-set snapshots snapshot-id (merge snapshot-data {active: true}))
+    (map-set snapshot-status snapshot-id true)
     (ok true)
   )
 )
@@ -208,11 +301,12 @@
     ((snapshot-id (unwrap! (safe-add (var-get current-snapshot-id) u1) ERR-OVERFLOW))
      (end-block (unwrap! (safe-add burn-block-height duration-blocks) ERR-OVERFLOW)))
     (try! (check-not-paused))
+    (try! (check-not-emergency))
     (try! (check-rate-limit tx-sender))
     (try! (validate-string-not-empty criteria-type))
     (asserts! (> min-threshold u0) ERR-INVALID-INPUT)
     (asserts! (> max-rewards u0) ERR-INVALID-INPUT)
-    (asserts! (> duration-blocks u0) ERR-INVALID-INPUT)
+    (asserts! (>= duration-blocks MIN-SNAPSHOT-DURATION) ERR-INVALID-INPUT)
     (asserts! 
       (is-some (map-get? registered-projects tx-sender)) 
       ERR-UNAUTHORIZED)
@@ -225,7 +319,10 @@
       active: true,
       end-block: end-block
     })
+    (map-set snapshot-status snapshot-id true)
+    (map-set tier-statistics snapshot-id {bronze: u0, silver: u0, gold: u0, platinum: u0})
     (var-set current-snapshot-id snapshot-id)
+    (var-set total-snapshots-created (unwrap! (safe-add (var-get total-snapshots-created) u1) ERR-OVERFLOW))
     (ok snapshot-id)
   )
 )
@@ -301,8 +398,14 @@
     ;; Update governance weights
     (update-governance-weight tx-sender token-id tier)
     
+    ;; Update tier statistics
+    (update-tier-stats snapshot-id tier)
+    
     ;; Update last token ID
     (var-set last-token-id token-id)
+    
+    ;; Update total rewards claimed
+    (var-set total-rewards-claimed (unwrap! (safe-add (var-get total-rewards-claimed) u1) ERR-OVERFLOW))
     
     ;; Mint loyalty tokens based on tier
     (try! (ft-mint? loyalty-token (unwrap! (safe-mul tier u100) ERR-OVERFLOW) tx-sender))
@@ -347,6 +450,38 @@
   )
 )
 
+;; Batch claim rewards for multiple snapshots
+(define-public (batch-claim-rewards (snapshot-ids (list 10 uint)))
+  (begin
+    (try! (check-not-paused))
+    (try! (check-not-emergency))
+    (try! (validate-batch-size (len snapshot-ids)))
+    (ok (map claim-single-reward snapshot-ids))
+  )
+)
+
+;; Helper for batch claiming
+(define-private (claim-single-reward (snapshot-id uint))
+  (match (claim-rewards snapshot-id)
+    success success
+    error u0
+  )
+)
+
+;; SIP-009 NFT Standard Compliance
+(define-read-only (get-last-token-id)
+  (ok (var-get last-token-id))
+)
+
+(define-read-only (get-token-uri (token-id uint))
+  (ok (get uri (default-to 
+    {tier: u0, snapshot-id: u0, score: u0, uri: ""} 
+    (map-get? token-metadata token-id))))
+)
+
+(define-read-only (get-owner (token-id uint))
+  (ok (nft-get-owner? loyalty-nft token-id))
+)
 
 ;; read only functions
 
@@ -370,23 +505,6 @@
 ;; Get token metadata
 (define-read-only (get-token-metadata (token-id uint))
   (map-get? token-metadata token-id)
-)
-
-;; Get token URI
-(define-read-only (get-token-uri (token-id uint))
-  (ok (get uri (default-to 
-    {tier: u0, snapshot-id: u0, score: u0, uri: ""} 
-    (map-get? token-metadata token-id))))
-)
-
-;; Get token owner
-(define-read-only (get-owner (token-id uint))
-  (ok (nft-get-owner? loyalty-nft token-id))
-)
-
-;; Get last token ID
-(define-read-only (get-last-token-id)
-  (ok (var-get last-token-id))
 )
 
 ;; Get governance weight for a user
@@ -414,6 +532,14 @@
   (var-get contract-paused)
 )
 
+(define-read-only (is-emergency-mode)
+  (var-get emergency-mode)
+)
+
+(define-read-only (get-last-emergency-action)
+  (var-get last-emergency-action)
+)
+
 (define-read-only (get-last-operation-block (user principal))
   (default-to u0 (map-get? last-operation-block user))
 )
@@ -423,6 +549,23 @@
     snapshot (some (get creator snapshot))
     none
   )
+)
+
+;; Statistics read-only functions
+(define-read-only (get-total-rewards-claimed)
+  (var-get total-rewards-claimed)
+)
+
+(define-read-only (get-total-snapshots-created)
+  (var-get total-snapshots-created)
+)
+
+(define-read-only (get-tier-statistics (snapshot-id uint))
+  (map-get? tier-statistics snapshot-id)
+)
+
+(define-read-only (get-snapshot-status (snapshot-id uint))
+  (default-to false (map-get? snapshot-status snapshot-id))
 )
 
 ;; private functions
@@ -452,6 +595,26 @@
         "ipfs://QmBronze/metadata.json"
       )
     )
+  )
+)
+
+;; Update tier statistics for a snapshot
+(define-private (update-tier-stats (snapshot-id uint) (tier uint))
+  (let ((current-stats (default-to {bronze: u0, silver: u0, gold: u0, platinum: u0} 
+          (map-get? tier-statistics snapshot-id))))
+    (map-set tier-statistics snapshot-id
+      (if (is-eq tier TIER-PLATINUM)
+        (merge current-stats {platinum: (+ (get platinum current-stats) u1)})
+        (if (is-eq tier TIER-GOLD)
+          (merge current-stats {gold: (+ (get gold current-stats) u1)})
+          (if (is-eq tier TIER-SILVER)
+            (merge current-stats {silver: (+ (get silver current-stats) u1)})
+            (merge current-stats {bronze: (+ (get bronze current-stats) u1)})
+          )
+        )
+      )
+    )
+    true
   )
 )
 
